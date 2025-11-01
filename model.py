@@ -26,6 +26,36 @@ class LayerNorm(nn.Module):
     def forward(self, input):
         return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
 
+class RotaryEmbedding(nn.Module):
+    def __init__(self, head_dim: int, base: int = 10000):
+        super().__init__()
+        assert head_dim % 2 == 0, "RoPE head_dim must be even"
+        inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2).float() / head_dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+    
+    def _build_cos_sin(self, seq_len: int, device, dtype):
+        t = torch.arange(seq_len, device=device, dtype=torch.float32)
+        freqs = torch.einsum('i,j->ij', t, self.inv_freq)
+        cos = torch.cos(freqs).to(dtype)
+        sin = torch.sin(freqs).to(dtype)
+        return cos, sin
+
+    def get_cos_sin(self, seq_len: int, device, dtype):
+        return self._build_cos_sin(seq_len, device, dtype)
+
+def apply_rope(x, cos, sin):
+    B, nh, T, embd = x.shape
+    x_even = x[..., ::2]
+    x_odd = x[..., 1::2]
+    cos = cos.view(1, 1, T, -1)
+    sin = sin.view(1, 1, T, -1)
+    x_even_rot = x_even * cos - x_odd * sin
+    x_odd_rot = x_even * sin + x_odd * cos
+    x_out = torch.empty_like(x)
+    x_out[..., ::2] = x_even_rot
+    x_out[..., 1::2] = x_odd_rot
+    return x_out
+
 class CausalSelfAttention(nn.Module):
 
     def __init__(self, config):
@@ -41,6 +71,10 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
+        self.head_dim = config.n_embd // config.n_head
+
+        assert self.head_dim % 2 == 0, "RoPE requires head_dim to be even"
+        self.rope = RotaryEmbedding(self.head_dim, base=config.rope_base)
         # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
         if not self.flash:
@@ -57,6 +91,10 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+
+        cos, sin = self.rope.get_cos_sin(T, device=x.device, dtype=x.dtype)
+        q = apply_rope(q, cos, sin)
+        k = apply_rope(k, cos, sin)
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
@@ -114,6 +152,7 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    rope_base: int = 10000
 
 class GPT(nn.Module):
 
@@ -125,7 +164,6 @@ class GPT(nn.Module):
 
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
-            wpe = nn.Embedding(config.block_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
@@ -155,8 +193,6 @@ class GPT(nn.Module):
         params are actually used as weights in the final layer, so we include them.
         """
         n_params = sum(p.numel() for p in self.parameters())
-        if non_embedding:
-            n_params -= self.transformer.wpe.weight.numel()
         return n_params
 
     def _init_weights(self, module):
@@ -175,8 +211,7 @@ class GPT(nn.Module):
 
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
-        x = self.transformer.drop(tok_emb + pos_emb)
+        x = self.transformer.drop(tok_emb)
         for block in self.transformer.h:
             x = block(x)
         x = self.transformer.ln_f(x)
