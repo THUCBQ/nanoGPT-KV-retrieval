@@ -1,7 +1,7 @@
 # train a miniature character-level shakespeare model
 # good for debugging and playing on macbooks and such
 
-out_dir = 'k-judge'
+out_dir = 'kv-retrieval'
 eval_interval = 250 # keep frequent because we'll overfit
 eval_iters = 100
 log_interval = 10 # don't print too too often
@@ -9,16 +9,16 @@ log_interval = 10 # don't print too too often
 # we expect to overfit on this small dataset, so only save when val improves
 always_save_checkpoint = False
 
-dataset = 'k_judge'
-tokens_per_pass = 65536
+dataset = 'kv_retrieval'
+tokens_per_pass = 32768
 gradient_accumulation_steps = 1
-block_size = 65536 # context of up to 1024 previous characters
+block_size = 4096 # context of up to 1024 previous characters
 batch_size = tokens_per_pass // block_size
 
 # baby GPT model :)
-n_layer = 1
-n_head = 4
-n_embd = 256
+n_layer = 2
+n_head = 8
+n_embd = 512
 dropout = 0.0
 
 learning_rate = 2e-4 # with baby networks can afford to go a bit higher
@@ -36,5 +36,5 @@ dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported
 compile = True # use PyTorch 2.0 to compile the model to be faster
 
 wandb_log = True # override via command line if you like
-wandb_project = 'nanoGPT-kjudge'
+wandb_project = 'nanoGPT-KVretrieval'
 wandb_run_name = f'KV-L{n_layer}-H{n_head}-D{n_embd}-SEQLEN{block_size}'

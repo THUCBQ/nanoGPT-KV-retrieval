@@ -118,14 +118,14 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 
 # poor man's data loader
 data_dir = os.path.join('data', dataset)
-if dataset in ('k_judge', ):
+if dataset in ('k_judge', 'kv_retrieval'):
     # keep different block_size datasets under separate subdirectories
     data_dir = os.path.join(data_dir, f"bs{block_size}")
     os.makedirs(data_dir, exist_ok=True)
 
-# Auto-generation for k_judge (mirrors kv_retrieval behavior, separate bs subdirs)
-def _ensure_k_judge_data(data_dir: str, block_size: int):
-    if dataset not in ('k_judge', ):
+# Auto-generation for k_judge and kv_retrieval
+def _ensure_retrieval_data(data_dir: str, block_size: int):
+    if dataset not in ('k_judge', 'kv_retrieval'):
         return
     prep_path = os.path.join('data', dataset, 'prepare.py')
     meta_path = os.path.join(data_dir, 'meta.pkl')
@@ -179,7 +179,7 @@ def _ensure_k_judge_data(data_dir: str, block_size: int):
                     break
                 time.sleep(0.5)
 
-_ensure_k_judge_data(data_dir, block_size)
+_ensure_retrieval_data(data_dir, block_size)
 
 # Answer-aware sampling for kv_retrieval
 # We want the last token of Y (i.e., data[i+block_size]) to always lie
@@ -383,6 +383,10 @@ def estimate_metrics():
                 logits, loss = model(X, Y)
             losses[k] = loss.item()
             pred_tokens = torch.argmax(logits, dim=-1)
+            # if split == 'val':
+            #     print(pred_tokens[0, -3:].tolist(), '###', Y[0, -3:].tolist())  # debug
+            #     print("corresponding strings translated from tokens:", tiktoken.get_encoding('gpt2').decode(pred_tokens[0, -10:].tolist()), "###",
+            #             tiktoken.get_encoding('gpt2').decode(Y[0, -10:].tolist()))
             acc_last = (pred_tokens[:, -1] == Y[:, -1]).float().mean().item()
             accs_last[k] = acc_last
         
