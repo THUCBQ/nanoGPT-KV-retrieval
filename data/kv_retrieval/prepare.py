@@ -71,7 +71,7 @@ def fit_db_kv(
         v_len = rng.randint(min_v, max_v)
         k = gen_random_str(rng, k_len)
         v = gen_random_str(rng, v_len)
-        pointer = '>' * rng.randint(1, 4)  # 1-3 '>' chars
+        pointer = '>' * rng.randint(1, 1)  # 1-3 '>' chars
         frag = f"|{k}{pointer}{v}|"
         cand = s + frag
         cand_ids = enc_with_newline(cand)
@@ -147,7 +147,7 @@ def build_episode(
         if not k:
             break  # no KV available in this episode
         ans = v
-        line = f"?{k}={ans}"
+        line = f"?{k}={ans}\n"
         line_ids = enc.encode_ordinary(line)
         if len(line_ids) <= remaining_for_qa_body:
             ids.extend(line_ids)
@@ -228,8 +228,8 @@ def write_split(
 
 
 def main():
-    TRAIN_EPISODES = int(os.environ.get('TRAIN_EPISODES', 1_000))
-    VAL_EPISODES = int(os.environ.get('VAL_EPISODES', 100_000))
+    TRAIN_EPISODES = int(os.environ.get('TRAIN_EPISODES', 50_000))
+    VAL_EPISODES = int(os.environ.get('VAL_EPISODES', 10_000))
     SEED = int(os.environ.get('SEED', 1337))
     BLOCK_SIZE = int(os.environ.get('BLOCK_SIZE', 1024))
     WRITE_TXT = int(os.environ.get('WRITE_TXT', 1)) > 0
@@ -252,7 +252,7 @@ def main():
 
     print("Generating k_v_retrieval dataset... (minimal negative sampling: 1-char flip on keys)")
     print(f"train episodes: {TRAIN_EPISODES}, val episodes: {VAL_EPISODES}")
-    print(f"episode composition: ~1:2 DB:QA")
+    print(f"episode composition: ~1:1 DB:QA")
     print(f"block_size: {BLOCK_SIZE}, seed: {SEED}, write_txt: {WRITE_TXT}, workers: {WORKERS}")
 
     write_split(train_path, enc, TRAIN_EPISODES, SEED, BLOCK_SIZE, WRITE_TXT, WORKERS)

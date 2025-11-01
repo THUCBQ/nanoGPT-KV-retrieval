@@ -168,7 +168,7 @@ def _ensure_retrieval_data(data_dir: str, block_size: int):
             print(f"[{dataset}] Generating dataset with BLOCK_SIZE={block_size} ...")
             env = os.environ.copy()
             env['BLOCK_SIZE'] = str(block_size)
-            env['WRITE_TXT'] = '1'
+            env['WRITE_TXT'] = '0'
             env['OUT_DIR'] = os.path.abspath(data_dir)
             cmd = [sys.executable, prep_path]
             subprocess.run(cmd, env=env, check=True)
@@ -248,8 +248,7 @@ def get_batch(split):
         data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
     else:
         data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
-
-    if dataset in ('k_judge', ):
+    if dataset in ('k_judge', 'kv_retrieval'):
         # Prefer answer-aware sampling so that Y's last token is inside an answer 'A'
         starts, ends, cum = _get_answer_segments(split)
         if cum.size > 0:
@@ -264,6 +263,7 @@ def get_batch(split):
             prev_cum[seg_idx > 0] = torch.from_numpy(cum[:-1]).to(torch.int64)[seg_idx[seg_idx > 0]-1]
             offset = r - prev_cum
             start_t = torch.from_numpy(starts).to(torch.int64)[seg_idx]
+            end_t = torch.from_numpy(ends).to(torch.int64)[seg_idx]
             j_sel = start_t + offset
             ix = (j_sel - block_size).to(torch.int64)
         else:
@@ -279,16 +279,43 @@ def get_batch(split):
 
     x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
     y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
+
+    # compute answer spans relative to Y for datasets that have answer segments
+    answer_spans = None
+    if dataset in ('k_judge', 'kv_retrieval'):
+        try:
+            # ix is i (start index of X in the absolute data stream)
+            # Y corresponds to absolute indices [i+1, i+block_size]
+            # compute y_start = start_abs - (i+1), y_end = end_abs - (i+1)
+            # clamp to [0, block_size]
+            start_abs = start_t
+            end_abs = end_t
+            i_abs = ix.to(torch.int64)
+            y_start = start_abs - (i_abs + 1)
+            y_end = end_abs - (i_abs + 1)
+            y_start = torch.clamp(y_start, min=0)
+            y_end = torch.clamp(y_end, min=0, max=block_size)
+            answer_spans = (y_start.cpu(), y_end.cpu())
+        except Exception:
+            answer_spans = None
+
     if device_type == 'cuda':
         # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
         x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
     else:
         x, y = x.to(device), y.to(device)
-    return x, y
+    return x, y, answer_spans
 
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
 iter_num = 0
 best_val_loss = 1e9
+# track best metrics for wandb logging (both train and val splits)
+best_train_last_token_acc = 0.0
+best_val_last_token_acc = 0.0
+best_train_answer_token_acc = 0.0
+best_val_answer_token_acc = 0.0
+best_train_answer_exact_match = 0.0
+best_val_answer_exact_match = 0.0
 
 # attempt to derive vocab_size from the dataset
 meta_path = os.path.join(data_dir, 'meta.pkl')
@@ -371,28 +398,60 @@ if ddp:
 # helps estimate an arbitrarily accurate loss over either split using many batches
 @torch.no_grad()
 def estimate_metrics():
-    """Estimate loss and last-token accuracy over many batches."""
+    """Estimate loss, last-token accuracy, answer-token accuracy and answer exact-match over many batches."""
     out = {}
     model.eval()
     for split in ['train', 'val']:
         losses = torch.zeros(eval_iters)
         accs_last = torch.zeros(eval_iters)
+        # answer-segment metrics
+        ans_token_correct = 0
+        ans_token_total = 0
+        ans_exact_matches = 0
+        ans_samples_with_answer = 0
         for k in range(eval_iters):
-            X, Y = get_batch(split)
+            X, Y, spans = get_batch(split)
             with ctx:
                 logits, loss = model(X, Y)
             losses[k] = loss.item()
             pred_tokens = torch.argmax(logits, dim=-1)
-            # if split == 'val':
-            #     print(pred_tokens[0, -3:].tolist(), '###', Y[0, -3:].tolist())  # debug
-            #     print("corresponding strings translated from tokens:", tiktoken.get_encoding('gpt2').decode(pred_tokens[0, -10:].tolist()), "###",
-            #             tiktoken.get_encoding('gpt2').decode(Y[0, -10:].tolist()))
             acc_last = (pred_tokens[:, -1] == Y[:, -1]).float().mean().item()
             accs_last[k] = acc_last
-        
+
+            # compute answer-segment token accuracy and exact match when spans available
+            if spans is not None:
+                y_start, y_end = spans
+                # y_start, y_end are CPU tensors of shape (batch_size,)
+                for b in range(Y.size(0)):
+                    s = int(y_start[b].item())
+                    e = int(y_end[b].item())
+                    if e <= s:
+                        continue
+                    tgt = Y[b, s:e]
+                    pred = pred_tokens[b, s:e]
+                    correct = (pred == tgt).sum().item()
+                    total = tgt.numel()
+                    ans_token_correct += correct
+                    ans_token_total += total
+                    if correct == total:
+                        ans_exact_matches += 1
+                    ans_samples_with_answer += 1
+
+        # finalize answer-segment metrics
+        if ans_token_total > 0:
+            ans_token_acc = ans_token_correct / ans_token_total
+        else:
+            ans_token_acc = 0.0
+        if ans_samples_with_answer > 0:
+            ans_exact_match_rate = ans_exact_matches / ans_samples_with_answer
+        else:
+            ans_exact_match_rate = 0.0
+
         out[split] = {
             'loss': losses.mean().item(),
             'last_token_acc': accs_last.mean().item(),
+            'answer_token_acc': ans_token_acc,
+            'answer_exact_match': ans_exact_match_rate,
         }
     model.train()
     return out
@@ -417,7 +476,7 @@ if wandb_log and master_process:
     wandb.init(project=wandb_project, name=wandb_run_name, config=config)
 
 # training loop
-X, Y = get_batch('train') # fetch the very first batch
+X, Y, _ = get_batch('train') # fetch the very first batch (ignore spans)
 t0 = time.time()
 start_t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
@@ -437,12 +496,32 @@ while True:
         val_loss = metrics['val']['loss']
         train_acc = metrics['train']['last_token_acc']
         val_acc = metrics['val']['last_token_acc']
+        train_ans_token_acc = metrics['train'].get('answer_token_acc', 0.0)
+        val_ans_token_acc = metrics['val'].get('answer_token_acc', 0.0)
+        train_ans_exact = metrics['train'].get('answer_exact_match', 0.0)
+        val_ans_exact = metrics['val'].get('answer_exact_match', 0.0)
+        
+            # update best-seen metrics (train/val)
+            if train_acc > best_train_last_token_acc:
+                best_train_last_token_acc = train_acc
+            if val_acc > best_val_last_token_acc:
+                best_val_last_token_acc = val_acc
+            if train_ans_token_acc > best_train_answer_token_acc:
+                best_train_answer_token_acc = train_ans_token_acc
+            if val_ans_token_acc > best_val_answer_token_acc:
+                best_val_answer_token_acc = val_ans_token_acc
+            if train_ans_exact > best_train_answer_exact_match:
+                best_train_answer_exact_match = train_ans_exact
+            if val_ans_exact > best_val_answer_exact_match:
+                best_val_answer_exact_match = val_ans_exact
         if iter_num > 0:
             elapsed_time = time.time() - start_t0
             total_estimated_time = elapsed_time / iter_num * max_iters
             print(f"step {iter_num}: estimated total training time: {total_estimated_time/3600:.2f} hours")
         print(f"step {iter_num}: train loss {train_loss:.4f}, val loss {val_loss:.4f}"
-            f"\ntrain last_acc {train_acc:.4f}, val last_acc {val_acc:.4f}")
+            f"\ntrain last_acc {train_acc:.4f}, val last_acc {val_acc:.4f}"
+            f"\ntrain ans_token_acc {train_ans_token_acc:.4f}, val ans_token_acc {val_ans_token_acc:.4f}"
+            f"\ntrain ans_exact {train_ans_exact:.4f}, val ans_exact {val_ans_exact:.4f}")
         if wandb_log:
             wandb.log({
                 "iter": iter_num,
@@ -450,7 +529,18 @@ while True:
                 "val/loss": val_loss,
                 "train/last_token_acc": train_acc,
                 "val/last_token_acc": val_acc,
+                "train/answer_token_acc": train_ans_token_acc,
+                "val/answer_token_acc": val_ans_token_acc,
+                "train/answer_exact_match": train_ans_exact,
+                "val/answer_exact_match": val_ans_exact,
                 "best_val_loss": min(best_val_loss, val_loss) if best_val_loss is not None else val_loss,
+                # log the best seen metrics (train and val)
+                "best/train/last_token_acc": best_train_last_token_acc,
+                "best/val/last_token_acc": best_val_last_token_acc,
+                "best/train/answer_token_acc": best_train_answer_token_acc,
+                "best/val/answer_token_acc": best_val_answer_token_acc,
+                "best/train/answer_exact_match": best_train_answer_exact_match,
+                "best/val/answer_exact_match": best_val_answer_exact_match,
                 "total_tokens": iter_num * tokens_per_iter,
                 "total_samples": iter_num * tokens_per_iter // block_size,
                 "lr": lr,
@@ -465,6 +555,13 @@ while True:
                     'model_args': model_args,
                     'iter_num': iter_num,
                     'best_val_loss': best_val_loss,
+                    # also store best-seen metrics so resume can continue logging them
+                    'best_train_last_token_acc': best_train_last_token_acc,
+                    'best_val_last_token_acc': best_val_last_token_acc,
+                    'best_train_answer_token_acc': best_train_answer_token_acc,
+                    'best_val_answer_token_acc': best_val_answer_token_acc,
+                    'best_train_answer_exact_match': best_train_answer_exact_match,
+                    'best_val_answer_exact_match': best_val_answer_exact_match,
                     'config': config,
                 }
                 print(f"saving checkpoint to {out_dir}")
@@ -485,7 +582,7 @@ while True:
             logits, loss = model(X, Y)
             loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
-        X, Y = get_batch('train')
+        X, Y, _ = get_batch('train')
         # backward pass, with gradient scaling if training in fp16
         scaler.scale(loss).backward()
     # clip the gradient

@@ -12,7 +12,7 @@ always_save_checkpoint = False
 dataset = 'kv_retrieval'
 tokens_per_pass = 32768
 gradient_accumulation_steps = 1
-block_size = 4096 # context of up to 1024 previous characters
+block_size = 1024 # context length
 batch_size = tokens_per_pass // block_size
 
 # baby GPT model :)
