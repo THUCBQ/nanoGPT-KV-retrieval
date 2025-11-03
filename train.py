@@ -69,6 +69,8 @@ decay_lr = True # whether to decay the learning rate
 warmup_iters = 2000 # how many steps to warm up for
 lr_decay_iters = 600000 # should be ~= max_iters per Chinchilla
 min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
+# whether to compute loss only on answer spans for kv_retrieval / k_judge datasets
+use_masked_answer_loss = True
 # DDP settings
 backend = 'nccl' # 'nccl', 'gloo', etc.
 # system
@@ -304,6 +306,7 @@ def get_batch(split):
         x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
     else:
         x, y = x.to(device), y.to(device)
+    # keep answer_spans as tuple of tensors on CPU (or None). Callers should move them to device as needed.
     return x, y, answer_spans
 
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
@@ -411,9 +414,16 @@ def estimate_metrics():
         ans_samples_with_answer = 0
         for k in range(eval_iters):
             X, Y, spans = get_batch(split)
-            with ctx:
-                logits, loss = model(X, Y)
-            losses[k] = loss.item()
+            if use_masked_answer_loss:
+                with ctx:
+                    logits, _ = model(X, Y)
+                # compute loss only on answer spans when available
+                loss_masked = _masked_cross_entropy_on_answer(logits, Y, spans)
+                losses[k] = loss_masked.item()
+            else:
+                with ctx:
+                    _, loss = model(X, Y)
+                losses[k] = loss.item()
             pred_tokens = torch.argmax(logits, dim=-1)
             acc_last = (pred_tokens[:, -1] == Y[:, -1]).float().mean().item()
             accs_last[k] = acc_last
@@ -456,6 +466,47 @@ def estimate_metrics():
     model.train()
     return out
 
+
+def _masked_cross_entropy_on_answer(logits, targets, spans):
+    """Compute cross entropy loss only on the answer span tokens provided by spans.
+
+    logits: (B, T, V), targets: (B, T), spans: (y_start_cpu, y_end_cpu) or None.
+    If spans is None or no tokens selected, falls back to full-token loss.
+    """
+    # logits: B,T,V ; targets: B,T
+    if spans is None:
+        return F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+    y_start, y_end = spans
+    # ensure spans tensors are non-empty and on the same device as targets
+    if not isinstance(y_start, torch.Tensor) or y_start.numel() == 0:
+        # fallback to full loss
+        return F.cross_entropy(logits.view(-0 if False else -1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+    y_start = y_start.to(targets.device)
+    y_end = y_end.to(targets.device)
+
+    B, T = targets.shape
+    mask = torch.zeros_like(targets, dtype=torch.bool, device=targets.device)
+    for b in range(B):
+        # safe indexing in case shapes mismatch
+        if b >= y_start.size(0):
+            continue
+        s = int(y_start[b].item())
+        e = int(y_end[b].item())
+        # clamp
+        s = max(0, min(T, s))
+        e = max(0, min(T, e))
+        if e > s:
+            mask[b, s:e] = True
+
+    if mask.sum() == 0:
+        # no answer tokens present in this batch: fallback to full loss
+        return F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+
+    targets_masked = targets.clone()
+    targets_masked[~mask] = -1
+    loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets_masked.view(-1), ignore_index=-1)
+    return loss
+
 # learning rate decay scheduler (cosine with warmup)
 def get_lr(it):
     # 1) linear warmup for warmup_iters steps
@@ -476,7 +527,7 @@ if wandb_log and master_process:
     wandb.init(project=wandb_project, name=wandb_run_name, config=config)
 
 # training loop
-X, Y, _ = get_batch('train') # fetch the very first batch (ignore spans)
+X, Y, spans = get_batch('train') # fetch the very first batch (keep spans to compute masked loss)
 t0 = time.time()
 start_t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
@@ -500,20 +551,19 @@ while True:
         val_ans_token_acc = metrics['val'].get('answer_token_acc', 0.0)
         train_ans_exact = metrics['train'].get('answer_exact_match', 0.0)
         val_ans_exact = metrics['val'].get('answer_exact_match', 0.0)
-        
-            # update best-seen metrics (train/val)
-            if train_acc > best_train_last_token_acc:
-                best_train_last_token_acc = train_acc
-            if val_acc > best_val_last_token_acc:
-                best_val_last_token_acc = val_acc
-            if train_ans_token_acc > best_train_answer_token_acc:
-                best_train_answer_token_acc = train_ans_token_acc
-            if val_ans_token_acc > best_val_answer_token_acc:
-                best_val_answer_token_acc = val_ans_token_acc
-            if train_ans_exact > best_train_answer_exact_match:
-                best_train_answer_exact_match = train_ans_exact
-            if val_ans_exact > best_val_answer_exact_match:
-                best_val_answer_exact_match = val_ans_exact
+        # update best-seen metrics (train/val)
+        if train_acc > best_train_last_token_acc:
+            best_train_last_token_acc = train_acc
+        if val_acc > best_val_last_token_acc:
+            best_val_last_token_acc = val_acc
+        if train_ans_token_acc > best_train_answer_token_acc:
+            best_train_answer_token_acc = train_ans_token_acc
+        if val_ans_token_acc > best_val_answer_token_acc:
+            best_val_answer_token_acc = val_ans_token_acc
+        if train_ans_exact > best_train_answer_exact_match:
+            best_train_answer_exact_match = train_ans_exact
+        if val_ans_exact > best_val_answer_exact_match:
+            best_val_answer_exact_match = val_ans_exact
         if iter_num > 0:
             elapsed_time = time.time() - start_t0
             total_estimated_time = elapsed_time / iter_num * max_iters
@@ -578,11 +628,18 @@ while True:
             # I really dislike that this bloats the code and forces us to repeat code
             # looking at the source of that context manager, it just toggles this variable
             model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
-        with ctx:
-            logits, loss = model(X, Y)
+        if use_masked_answer_loss:
+            with ctx:
+                logits, _ = model(X, Y)
+            # compute loss only on answer spans
+            loss = _masked_cross_entropy_on_answer(logits, Y, spans)
+            loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
+        else:
+            with ctx:
+                _, loss = model(X, Y)
             loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
-        X, Y, _ = get_batch('train')
+        X, Y, spans = get_batch('train')
         # backward pass, with gradient scaling if training in fp16
         scaler.scale(loss).backward()
     # clip the gradient

@@ -12,7 +12,7 @@ always_save_checkpoint = False
 dataset = 'kv_retrieval'
 tokens_per_pass = 32768
 gradient_accumulation_steps = 1
-block_size = 1024 # context length
+block_size = 16384 # context length
 batch_size = tokens_per_pass // block_size
 
 # baby GPT model :)
@@ -22,7 +22,7 @@ n_embd = 512
 dropout = 0.0
 
 learning_rate = 2e-4 # with baby networks can afford to go a bit higher
-max_iters = 10000
+max_iters = 200000
 lr_decay_iters = max_iters # make equal to max_iters usually
 min_lr = learning_rate / 10 # learning_rate / 10 usually
 beta2 = 0.95 # make a bit bigger because number of tokens per iter is small
@@ -38,3 +38,6 @@ compile = True # use PyTorch 2.0 to compile the model to be faster
 wandb_log = True # override via command line if you like
 wandb_project = 'nanoGPT-KVretrieval'
 wandb_run_name = f'KV-L{n_layer}-H{n_head}-D{n_embd}-SEQLEN{block_size}'
+# Whether to compute loss only on answer spans (when dataset has answer spans).
+# Set to False to use the original full-sequence loss.
+use_masked_answer_loss = True

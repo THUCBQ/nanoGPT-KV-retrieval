@@ -228,7 +228,7 @@ def write_split(
 
 
 def main():
-    TRAIN_EPISODES = int(os.environ.get('TRAIN_EPISODES', 50_000))
+    TRAIN_EPISODES = int(os.environ.get('TRAIN_EPISODES', 100_000))
     VAL_EPISODES = int(os.environ.get('VAL_EPISODES', 10_000))
     SEED = int(os.environ.get('SEED', 1337))
     BLOCK_SIZE = int(os.environ.get('BLOCK_SIZE', 1024))
@@ -241,7 +241,7 @@ def main():
     WORKERS = int(os.environ.get('WORKERS', default_workers))
     if WORKERS < 1:
         WORKERS = 1
-    WORKERS = cpu_cnt if isinstance(cpu_cnt, int) and cpu_cnt > 0 else WORKERS
+    WORKERS = min(WORKERS, cpu_cnt) if isinstance(cpu_cnt, int) and cpu_cnt > 0 else WORKERS
 
     enc = tiktoken.get_encoding('gpt2')
 
@@ -250,7 +250,7 @@ def main():
     train_path = os.path.join(dstdir, 'train.bin')
     val_path = os.path.join(dstdir, 'val.bin')
 
-    print("Generating k_v_retrieval dataset... (minimal negative sampling: 1-char flip on keys)")
+    print("Generating k_v_retrieval dataset...")
     print(f"train episodes: {TRAIN_EPISODES}, val episodes: {VAL_EPISODES}")
     print(f"episode composition: ~1:1 DB:QA")
     print(f"block_size: {BLOCK_SIZE}, seed: {SEED}, write_txt: {WRITE_TXT}, workers: {WORKERS}")
