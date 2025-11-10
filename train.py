@@ -29,8 +29,11 @@ import numpy as np
 import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
+from typing import Dict, List
 
 from model import GPTConfig, GPT
+
+from torch.nn import functional as F
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
@@ -124,10 +127,18 @@ if dataset in ('k_judge', 'kv_retrieval'):
     # keep different block_size datasets under separate subdirectories
     data_dir = os.path.join(data_dir, f"bs{block_size}")
     os.makedirs(data_dir, exist_ok=True)
+elif dataset == 'kv_retrieval_multihop':
+    # use both block_size and HOPS to namespace the dataset folder
+    try:
+        hops_cfg = int(globals().get('HOPS', os.environ.get('HOPS', 4)))
+    except Exception:
+        hops_cfg = int(os.environ.get('HOPS', 4))
+    data_dir = os.path.join(data_dir, f"bs{block_size}_h{hops_cfg}")
+    os.makedirs(data_dir, exist_ok=True)
 
 # Auto-generation for k_judge and kv_retrieval
 def _ensure_retrieval_data(data_dir: str, block_size: int):
-    if dataset not in ('k_judge', 'kv_retrieval'):
+    if dataset not in ('k_judge', 'kv_retrieval', 'kv_retrieval_multihop'):
         return
     prep_path = os.path.join('data', dataset, 'prepare.py')
     meta_path = os.path.join(data_dir, 'meta.pkl')
@@ -144,11 +155,23 @@ def _ensure_retrieval_data(data_dir: str, block_size: int):
                 meta_chk = pickle.load(f)
             meta_block_size = meta_chk.get('block_size', None)
             meta_fmt = meta_chk.get('format_version', None)
-            if meta_block_size == block_size and meta_fmt == 2:
-                meta_ok = True
+            if dataset == 'kv_retrieval_multihop':
+                try:
+                    hops_cfg = int(globals().get('HOPS', os.environ.get('HOPS', 4)))
+                except Exception:
+                    hops_cfg = int(os.environ.get('HOPS', 4))
+                meta_hops = meta_chk.get('hops', None)
+                if meta_block_size == block_size and meta_fmt == 2 and meta_hops == hops_cfg:
+                    meta_ok = True
+                else:
+                    if master_process:
+                        print(f"[{dataset}] meta mismatch. meta: block_size={meta_block_size}, hops={meta_hops}, format_version={meta_fmt}; expected block_size={block_size}, hops={hops_cfg}, format_version=2. Will regenerate.")
             else:
-                if master_process:
-                    print(f"[{dataset}] meta mismatch. meta: block_size={meta_block_size}, format_version={meta_fmt}; expected block_size={block_size}, format_version=2. Will regenerate.")
+                if meta_block_size == block_size and meta_fmt == 2:
+                    meta_ok = True
+                else:
+                    if master_process:
+                        print(f"[{dataset}] meta mismatch. meta: block_size={meta_block_size}, format_version={meta_fmt}; expected block_size={block_size}, format_version=2. Will regenerate.")
         except Exception:
             if master_process:
                 print(f"[{dataset}] unable to read meta at {meta_path}, will regenerate dataset.")
@@ -170,8 +193,15 @@ def _ensure_retrieval_data(data_dir: str, block_size: int):
             print(f"[{dataset}] Generating dataset with BLOCK_SIZE={block_size} ...")
             env = os.environ.copy()
             env['BLOCK_SIZE'] = str(block_size)
+            # For multihop, write txt for readability by default
             env['WRITE_TXT'] = '0'
             env['OUT_DIR'] = os.path.abspath(data_dir)
+            # Pass HOPS if configured
+            if 'HOPS' in globals():
+                try:
+                    env['HOPS'] = str(int(globals()['HOPS']))
+                except Exception:
+                    pass
             cmd = [sys.executable, prep_path]
             subprocess.run(cmd, env=env, check=True)
             print(f"[{dataset}] Generation complete.")
@@ -243,6 +273,33 @@ def _get_answer_segments(split: str):
     _answer_seg_cache[split] = seg
     return seg
 
+# For kv_retrieval_multihop: cache answer token absolute indices (positions of label token)
+_mh_answer_pos_cache = {}
+
+def _mh_get_answer_positions(split: str):
+    if split in _mh_answer_pos_cache:
+        return _mh_answer_pos_cache[split]
+    bin_path = os.path.join(data_dir, 'train.bin' if split == 'train' else 'val.bin')
+    meta_path_local = os.path.join(data_dir, 'meta.pkl')
+    try:
+        with open(meta_path_local, 'rb') as f_meta:
+            meta_local = pickle.load(f_meta)
+        ans_start_token = int(meta_local['special_tokens']['ANS_START'])
+    except Exception:
+        return np.array([], dtype=np.int64)
+    data = np.memmap(bin_path, dtype=np.uint16, mode='r')
+    # answer at j when data[j-1] == ANS_START; ignore j < block_size for valid sampling
+    idx_ans_start = np.nonzero(data == ans_start_token)[0]
+    if idx_ans_start.size == 0:
+        arr = np.array([], dtype=np.int64)
+    else:
+        j_positions = idx_ans_start + 1
+        # filter within bounds
+        j_positions = j_positions[(j_positions >= block_size) & (j_positions < len(data))]
+        arr = j_positions.astype(np.int64)
+    _mh_answer_pos_cache[split] = arr
+    return arr
+
 def get_batch(split):
     # We recreate np.memmap every batch to avoid a memory leak, as per
     # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
@@ -275,6 +332,16 @@ def get_batch(split):
                 print(f"[{dataset}] Warning: no answer positions found for split '{split}', falling back to uniform sampling.")
                 _answer_pos_warned.add(split)
             ix = torch.randint(len(data) - block_size, (batch_size,))
+    elif dataset == 'kv_retrieval_multihop':
+        # Answer-aware sampling: ensure Y[-1] is an answer label (immediately after ANS_START)
+        j_positions = _mh_get_answer_positions(split)
+        if j_positions.size > 0:
+            # sample j uniformly from positions, then i = j - block_size
+            sel = torch.randint(j_positions.size, (batch_size,), dtype=torch.int64)
+            j_sel = torch.from_numpy(j_positions).to(torch.int64)[sel]
+            ix = (j_sel - block_size).to(torch.int64)
+        else:
+            ix = torch.randint(len(data) - block_size, (batch_size,))
     else:
         # Uniform sampling over entire stream for all other datasets
         ix = torch.randint(len(data) - block_size, (batch_size,))
@@ -282,7 +349,11 @@ def get_batch(split):
     x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
     y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
 
-    # compute answer spans relative to Y for datasets that have answer segments
+    # compute answer spans or answer mask relative to Y for datasets that have answer targets
+    # answer_spans may be either:
+    # - None: no masking
+    # - tuple(y_start_cpu, y_end_cpu): original interface for contiguous spans (k_judge, kv_retrieval)
+    # - torch.BoolTensor mask of shape (B, T) on CPU marking positions in Y to include in loss (kv_retrieval_multihop)
     answer_spans = None
     if dataset in ('k_judge', 'kv_retrieval'):
         try:
@@ -300,14 +371,58 @@ def get_batch(split):
             answer_spans = (y_start.cpu(), y_end.cpu())
         except Exception:
             answer_spans = None
+    elif dataset == 'kv_retrieval_multihop':
+        # For multihop dataset the answers are single-token labels that follow ANS_START markers inside X.
+        # Create a per-sample boolean mask (on CPU) marking Y positions to include in the loss.
+        try:
+            meta_path_local = os.path.join(data_dir, 'meta.pkl')
+            with open(meta_path_local, 'rb') as f_meta:
+                meta_local = pickle.load(f_meta)
+            ans_start_token = int(meta_local['special_tokens']['ANS_START'])
+            # x is currently a CPU tensor of shape (B, T); answers to predict are Y[p] where X[p] == ANS_START
+            mask = (x == ans_start_token)
+            # mask dtype is bool on CPU; this will be interpreted by the masked loss function
+            answer_spans = mask.cpu()
+        except Exception:
+            answer_spans = None
 
     if device_type == 'cuda':
         # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
         x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
     else:
         x, y = x.to(device), y.to(device)
-    # keep answer_spans as tuple of tensors on CPU (or None). Callers should move them to device as needed.
+    # keep answer_spans as tuple of tensors on CPU, or boolean mask on CPU, or None.
+    # Callers should move them to device as needed inside the loss helper.
     return x, y, answer_spans
+
+# ---------------- Multihop answer token extraction -----------------
+# For kv_retrieval_multihop, answer tokens immediately follow ANS_START markers.
+# We treat each (ANS_START, label) as an answer span of length 1 (the label token).
+def _extract_multihop_answer_spans(x_batch: torch.Tensor, ans_start_token: int) -> tuple:
+    """Return (y_start, y_end) CPU tensors marking single-token answer spans in Y.
+
+    We locate ANS_START positions inside X (which is length block_size) but answers to predict are next tokens in Y.
+    For position p in X where X[p] == ANS_START, the predicted answer token is Y[p].
+    So span relative to Y is [p, p+1).
+    """
+    B, T = x_batch.shape
+    starts = []
+    ends = []
+    for b in range(B):
+        row = x_batch[b]
+        pos = (row == ans_start_token).nonzero(as_tuple=False).view(-1)
+        for p in pos:
+            p_int = int(p.item())
+            if p_int < T:  # answer token exists at Y[p]
+                starts.append(p_int)
+                ends.append(p_int + 1)
+    if not starts:
+        return None
+    # For uniform interface we need per-batch single span; but there can be multiple answers.
+    # We'll compress all answer tokens into one merged multi-segment by setting min start and max end if contiguous.
+    # However masked loss logic expects one span per batch element; easier: return None (no masking) and rely on metrics.
+    # Instead, for metrics we will handle multihop separately; return None here.
+    return None
 
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
 iter_num = 0
@@ -401,7 +516,10 @@ if ddp:
 # helps estimate an arbitrarily accurate loss over either split using many batches
 @torch.no_grad()
 def estimate_metrics():
-    """Estimate loss, last-token accuracy, answer-token accuracy and answer exact-match over many batches."""
+    """Estimate loss, last-token accuracy, answer-token accuracy and answer exact-match over many batches.
+
+    For kv_retrieval_multihop: answer tokens are labels directly after ANS_START markers (single-token answers).
+    """
     out = {}
     model.eval()
     for split in ['train', 'val']:
@@ -414,6 +532,19 @@ def estimate_metrics():
         ans_samples_with_answer = 0
         for k in range(eval_iters):
             X, Y, spans = get_batch(split)
+            # For multihop dataset, identify answer tokens inline
+            multihop_answer_positions = None
+            if dataset == 'kv_retrieval_multihop':
+                # Load special tokens from meta
+                meta_path_local = os.path.join(data_dir, 'meta.pkl')
+                try:
+                    with open(meta_path_local, 'rb') as f_meta:
+                        meta_local = pickle.load(f_meta)
+                    ans_start_token = meta_local['special_tokens']['ANS_START']
+                    # positions where X == ANS_START; Y at same index holds answer label
+                    multihop_answer_positions = (X == ans_start_token).nonzero(as_tuple=False)
+                except Exception:
+                    multihop_answer_positions = None
             if use_masked_answer_loss:
                 with ctx:
                     logits, _ = model(X, Y)
@@ -422,23 +553,24 @@ def estimate_metrics():
                 losses[k] = loss_masked.item()
             else:
                 with ctx:
-                    _, loss = model(X, Y)
+                    logits, loss = model(X, Y)
                 losses[k] = loss.item()
             pred_tokens = torch.argmax(logits, dim=-1)
             acc_last = (pred_tokens[:, -1] == Y[:, -1]).float().mean().item()
             accs_last[k] = acc_last
-
-            # compute answer-segment token accuracy and exact match when spans available
-            if spans is not None:
+            if dataset in ('k_judge', 'kv_retrieval') and spans is not None:
                 y_start, y_end = spans
-                # y_start, y_end are CPU tensors of shape (batch_size,)
+                T = Y.size(1)
+                half = T // 2
                 for b in range(Y.size(0)):
                     s = int(y_start[b].item())
                     e = int(y_end[b].item())
-                    if e <= s:
+                    # restrict to second half only
+                    s2 = max(s, half)
+                    if e <= s2:
                         continue
-                    tgt = Y[b, s:e]
-                    pred = pred_tokens[b, s:e]
+                    tgt = Y[b, s2:e]
+                    pred = pred_tokens[b, s2:e]
                     correct = (pred == tgt).sum().item()
                     total = tgt.numel()
                     ans_token_correct += correct
@@ -446,6 +578,34 @@ def estimate_metrics():
                     if correct == total:
                         ans_exact_matches += 1
                     ans_samples_with_answer += 1
+            elif dataset == 'kv_retrieval_multihop' and multihop_answer_positions is not None and multihop_answer_positions.numel() > 0:
+                # multihop_answer_positions: rows of [batch_index, position]
+                # Group by batch index to compute exact match per sample
+                by_batch: Dict[int, List[int]] = {}
+                T = Y.size(1)
+                half = T // 2
+                for row in multihop_answer_positions:
+                    b_idx = int(row[0].item())
+                    pos = int(row[1].item())
+                    # only consider answers in the second half
+                    if pos >= half:
+                        by_batch.setdefault(b_idx, []).append(pos)
+                for b, positions in by_batch.items():
+                    positions.sort()
+                    if len(positions) == 0:
+                        continue
+                    all_correct = True
+                    for pos in positions:
+                        tgt = Y[b, pos]
+                        pred = pred_tokens[b, pos]
+                        ans_token_total += 1
+                        if int(pred.item()) == int(tgt.item()):
+                            ans_token_correct += 1
+                        else:
+                            all_correct = False
+                    ans_samples_with_answer += 1
+                    if all_correct:
+                        ans_exact_matches += 1
 
         # finalize answer-segment metrics
         if ans_token_total > 0:
@@ -476,30 +636,43 @@ def _masked_cross_entropy_on_answer(logits, targets, spans):
     # logits: B,T,V ; targets: B,T
     if spans is None:
         return F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
-    y_start, y_end = spans
-    # ensure spans tensors are non-empty and on the same device as targets
-    if not isinstance(y_start, torch.Tensor) or y_start.numel() == 0:
-        # fallback to full loss
-        return F.cross_entropy(logits.view(-0 if False else -1, logits.size(-1)), targets.view(-1), ignore_index=-1)
-    y_start = y_start.to(targets.device)
-    y_end = y_end.to(targets.device)
 
-    B, T = targets.shape
-    mask = torch.zeros_like(targets, dtype=torch.bool, device=targets.device)
-    for b in range(B):
-        # safe indexing in case shapes mismatch
-        if b >= y_start.size(0):
-            continue
-        s = int(y_start[b].item())
-        e = int(y_end[b].item())
-        # clamp
-        s = max(0, min(T, s))
-        e = max(0, min(T, e))
-        if e > s:
-            mask[b, s:e] = True
+    # If spans is a boolean mask tensor (B, T) on CPU or device, use it directly
+    if isinstance(spans, torch.Tensor) and spans.dtype == torch.bool:
+        mask = spans.to(targets.device)
+        # ensure mask has same shape
+        if mask.dim() != targets.dim() or mask.size(0) != targets.size(0) or mask.size(1) != targets.size(1):
+            # shape mismatch, fall back to full loss
+            return F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+    else:
+        # assume spans is the (y_start_cpu, y_end_cpu) tuple interface
+        try:
+            y_start, y_end = spans
+        except Exception:
+            return F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+        # ensure spans tensors are non-empty
+        if not isinstance(y_start, torch.Tensor) or y_start.numel() == 0:
+            # fallback to full loss
+            return F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+        y_start = y_start.to(targets.device)
+        y_end = y_end.to(targets.device)
 
+        B, T = targets.shape
+        mask = torch.zeros_like(targets, dtype=torch.bool, device=targets.device)
+        for b in range(B):
+            # safe indexing in case shapes mismatch
+            if b >= y_start.size(0):
+                continue
+            s = int(y_start[b].item())
+            e = int(y_end[b].item())
+            # clamp
+            s = max(0, min(T, s))
+            e = max(0, min(T, e))
+            if e > s:
+                mask[b, s:e] = True
+
+    # if no positions selected, fall back to full loss
     if mask.sum() == 0:
-        # no answer tokens present in this batch: fallback to full loss
         return F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
 
     targets_masked = targets.clone()
@@ -533,6 +706,11 @@ start_t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model # unwrap DDP container if needed
 running_mfu = -1.0
+
+timestamp = time.strftime('%Y%m%d_%H%M%S')
+log_root = os.path.join('outs', wandb_run_name if 'wandb_run_name' in globals() else 'run') + timestamp
+os.makedirs(log_root, exist_ok=True)
+
 while True:
 
     # determine and set the learning rate for this iteration
@@ -596,6 +774,39 @@ while True:
                 "lr": lr,
                 "mfu": running_mfu*100, # convert to percentage
             })
+        # ---------------- Eval Sample Logging ----------------
+        if master_process:
+            # create unique eval log directory per run
+            timestamp = time.strftime('%Y%m%d_%H%M%S')
+            
+            log_path = os.path.join(log_root, f'eval_{iter_num}_{timestamp}.log')
+            try:
+                with open(log_path, 'w') as flog:
+                    # Get a fresh eval batch for logging predictions
+                    Xs, Ys, _sp = get_batch('val')
+                    with torch.no_grad():
+                        logits, _ = model(Xs, Ys)
+                        preds = torch.argmax(logits, dim=-1)
+                    max_show = min(5, Xs.size(0))
+                    # Only output the last N tokens for readability
+                    max_tokens_log = 100
+                    for b in range(max_show):
+                        x_tokens = Xs[b].cpu()
+                        y_tokens = Ys[b].cpu()
+                        p_tokens = preds[b].cpu()
+                        if x_tokens.numel() > max_tokens_log:
+                            x_tokens = x_tokens[-max_tokens_log:]
+                        if y_tokens.numel() > max_tokens_log:
+                            y_tokens = y_tokens[-max_tokens_log:]
+                        if p_tokens.numel() > max_tokens_log:
+                            p_tokens = p_tokens[-max_tokens_log:]
+                        flog.write('X: ' + ' '.join(str(int(t)) for t in x_tokens) + '\n')
+                        flog.write('Y: ' + ' '.join(str(int(t)) for t in y_tokens) + '\n')
+                        flog.write('P: ' + ' '.join(str(int(t)) for t in p_tokens) + '\n')
+                        flog.write('\n')
+                print(f"Logged eval samples to {log_path}")
+            except Exception as e:
+                print(f"Eval logging failed: {e}")
         if val_loss < best_val_loss or always_save_checkpoint:
             best_val_loss = val_loss
             if iter_num > 0:
