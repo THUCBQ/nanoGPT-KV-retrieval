@@ -29,7 +29,7 @@ import numpy as np
 import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
-from typing import Dict, List
+from typing import List
 
 from model import GPTConfig, GPT
 
@@ -60,6 +60,8 @@ n_head = 12
 n_embd = 768 
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
+attention_type = 'causal' # currently only 'causal' is the default/trusted option
+linear_backend = None # None (default) or 'fla_multiscale' or 'fla_deltanet' or 'fla_gateddeltanet'
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
 max_iters = 600000 # total number of training iterations
@@ -133,7 +135,11 @@ elif dataset == 'kv_retrieval_multihop':
         hops_cfg = int(globals().get('HOPS', os.environ.get('HOPS', 4)))
     except Exception:
         hops_cfg = int(os.environ.get('HOPS', 4))
-    data_dir = os.path.join(data_dir, f"bs{block_size}_h{hops_cfg}")
+    try:
+        maxh_cfg = int(globals().get('MAXHOPS', os.environ.get('MAXHOPS', hops_cfg)))
+    except Exception:
+        maxh_cfg = int(os.environ.get('MAXHOPS', hops_cfg))
+    data_dir = os.path.join(data_dir, f"bs{block_size}_h{hops_cfg}_maxh{maxh_cfg}")
     os.makedirs(data_dir, exist_ok=True)
 
 # Auto-generation for k_judge and kv_retrieval
@@ -160,12 +166,22 @@ def _ensure_retrieval_data(data_dir: str, block_size: int):
                     hops_cfg = int(globals().get('HOPS', os.environ.get('HOPS', 4)))
                 except Exception:
                     hops_cfg = int(os.environ.get('HOPS', 4))
+                try:
+                    maxh_cfg = int(globals().get('MAXHOPS', os.environ.get('MAXHOPS', hops_cfg)))
+                except Exception:
+                    maxh_cfg = int(os.environ.get('MAXHOPS', hops_cfg))
                 meta_hops = meta_chk.get('hops', None)
-                if meta_block_size == block_size and meta_fmt == 2 and meta_hops == hops_cfg:
+                meta_max_hops = meta_chk.get('max_hops', None)
+                if (
+                    meta_block_size == block_size
+                    and meta_fmt == 2
+                    and meta_hops == hops_cfg
+                    and meta_max_hops == maxh_cfg
+                ):
                     meta_ok = True
                 else:
                     if master_process:
-                        print(f"[{dataset}] meta mismatch. meta: block_size={meta_block_size}, hops={meta_hops}, format_version={meta_fmt}; expected block_size={block_size}, hops={hops_cfg}, format_version=2. Will regenerate.")
+                        print(f"[{dataset}] meta mismatch. meta: block_size={meta_block_size}, hops={meta_hops}, max_hops={meta_max_hops}, format_version={meta_fmt}; expected block_size={block_size}, hops={hops_cfg}, max_hops={maxh_cfg}, format_version=2. Will regenerate.")
             else:
                 if meta_block_size == block_size and meta_fmt == 2:
                     meta_ok = True
@@ -194,12 +210,18 @@ def _ensure_retrieval_data(data_dir: str, block_size: int):
             env = os.environ.copy()
             env['BLOCK_SIZE'] = str(block_size)
             # For multihop, write txt for readability by default
-            env['WRITE_TXT'] = '0'
+            env['WRITE_TXT'] = '1'
             env['OUT_DIR'] = os.path.abspath(data_dir)
             # Pass HOPS if configured
             if 'HOPS' in globals():
                 try:
                     env['HOPS'] = str(int(globals()['HOPS']))
+                except Exception:
+                    pass
+            # Pass MAXHOPS if configured so prepare.py can budget DB/QA accordingly
+            if 'MAXHOPS' in globals():
+                try:
+                    env['MAXHOPS'] = str(int(globals()['MAXHOPS']))
                 except Exception:
                     pass
             cmd = [sys.executable, prep_path]
@@ -220,6 +242,7 @@ _ensure_retrieval_data(data_dir, block_size)
 # and then sample i = j - block_size so that Y[-1] == data[j] is in A.
 _answer_seg_cache = {}
 _answer_pos_warned = set()
+_mh_bounds_cache = {}
 
 def _compute_answer_segments(bin_path: str, min_j: int):
     """Return tuple (starts, ends, cum_lengths) for answer segments within '?k=v\n'.
@@ -273,32 +296,55 @@ def _get_answer_segments(split: str):
     _answer_seg_cache[split] = seg
     return seg
 
-# For kv_retrieval_multihop: cache answer token absolute indices (positions of label token)
-_mh_answer_pos_cache = {}
 
-def _mh_get_answer_positions(split: str):
-    if split in _mh_answer_pos_cache:
-        return _mh_answer_pos_cache[split]
+def _mh_get_bounds(split: str):
+    """Return dict with qa_start and pad_start per-episode for multihop dataset."""
+    if split in _mh_bounds_cache:
+        return _mh_bounds_cache[split]
     bin_path = os.path.join(data_dir, 'train.bin' if split == 'train' else 'val.bin')
     meta_path_local = os.path.join(data_dir, 'meta.pkl')
+    enc = tiktoken.get_encoding('gpt2')
     try:
         with open(meta_path_local, 'rb') as f_meta:
             meta_local = pickle.load(f_meta)
-        ans_start_token = int(meta_local['special_tokens']['ANS_START'])
+        pad_token = meta_local['special_tokens'].get('PAD', None)
+        # if prepare.py precomputed mh_bounds, load them and return immediately
+        mh = meta_local.get('mh_bounds', None)
+        if mh is not None and split in mh:
+            try:
+                qa_arr = np.asarray(mh[split]['qa_start'], dtype=np.int64)
+                pad_arr = np.asarray(mh[split]['pad_start'], dtype=np.int64)
+                _mh_bounds_cache[split] = {'qa_start': qa_arr, 'pad_start': pad_arr}
+                return _mh_bounds_cache[split]
+            except Exception:
+                pass
+        if pad_token is None:
+            pad_token = enc.encode_ordinary('#')[0]
     except Exception:
-        return np.array([], dtype=np.int64)
+        pad_token = enc.encode_ordinary('#')[0]
+    qa_header = enc.encode_ordinary("\nQA\n")
     data = np.memmap(bin_path, dtype=np.uint16, mode='r')
-    # answer at j when data[j-1] == ANS_START; ignore j < block_size for valid sampling
-    idx_ans_start = np.nonzero(data == ans_start_token)[0]
-    if idx_ans_start.size == 0:
-        arr = np.array([], dtype=np.int64)
-    else:
-        j_positions = idx_ans_start + 1
-        # filter within bounds
-        j_positions = j_positions[(j_positions >= block_size) & (j_positions < len(data))]
-        arr = j_positions.astype(np.int64)
-    _mh_answer_pos_cache[split] = arr
-    return arr
+    num_episodes = len(data) // block_size
+    if num_episodes <= 0:
+        _mh_bounds_cache[split] = {'qa_start': np.array([], dtype=np.int64), 'pad_start': np.array([], dtype=np.int64)}
+        return _mh_bounds_cache[split]
+    data = data[:num_episodes * block_size].reshape(num_episodes, block_size)
+    qa_start = np.full(num_episodes, block_size // 2, dtype=np.int64)
+    pad_start = np.full(num_episodes, block_size - 1, dtype=np.int64)
+    pat_len = len(qa_header)
+    for ep in range(num_episodes):
+        row = data[ep]
+        idx_pad = np.where(row == pad_token)[0]
+        if idx_pad.size > 0:
+            pad_start[ep] = int(idx_pad[0])
+        if pat_len > 0 and pat_len < block_size:
+            # search first occurrence of QA header
+            for pos in range(block_size - pat_len):
+                if np.array_equal(row[pos:pos + pat_len], qa_header):
+                    qa_start[ep] = pos + pat_len
+                    break
+    _mh_bounds_cache[split] = {'qa_start': qa_start, 'pad_start': pad_start}
+    return _mh_bounds_cache[split]
 
 def get_batch(split):
     # We recreate np.memmap every batch to avoid a memory leak, as per
@@ -307,15 +353,14 @@ def get_batch(split):
         data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
     else:
         data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
+    start_t = None
+    end_t = None
     if dataset in ('k_judge', 'kv_retrieval'):
-        # Prefer answer-aware sampling so that Y's last token is inside an answer 'A'
+        # Prefer answer-aware sampling so that Y's last token is inside an answer span
         starts, ends, cum = _get_answer_segments(split)
         if cum.size > 0:
             total = int(cum[-1])
-            # sample positions in [0, total)
             r = torch.randint(total, (batch_size,), dtype=torch.int64)
-            # map to segment via searchsorted over cum lengths
-            # convert to numpy for searchsorted then back; batch size small so overhead negligible
             seg_idx = np.searchsorted(cum, r.cpu().numpy(), side='right')
             seg_idx = torch.from_numpy(seg_idx).to(torch.int64)
             prev_cum = torch.zeros_like(seg_idx)
@@ -326,22 +371,32 @@ def get_batch(split):
             j_sel = start_t + offset
             ix = (j_sel - block_size).to(torch.int64)
         else:
-            # Fallback to uniform sampling once, with a one-time notice
             global _answer_pos_warned
             if split not in _answer_pos_warned:
                 print(f"[{dataset}] Warning: no answer positions found for split '{split}', falling back to uniform sampling.")
                 _answer_pos_warned.add(split)
             ix = torch.randint(len(data) - block_size, (batch_size,))
     elif dataset == 'kv_retrieval_multihop':
-        # Answer-aware sampling: ensure Y[-1] is an answer label (immediately after ANS_START)
-        j_positions = _mh_get_answer_positions(split)
-        if j_positions.size > 0:
-            # sample j uniformly from positions, then i = j - block_size
-            sel = torch.randint(j_positions.size, (batch_size,), dtype=torch.int64)
-            j_sel = torch.from_numpy(j_positions).to(torch.int64)[sel]
-            ix = (j_sel - block_size).to(torch.int64)
-        else:
+        # Sample Y's last token after QA header and before PAD/EOT within the same episode.
+        bounds = _mh_get_bounds(split)
+        qa_start = torch.from_numpy(bounds['qa_start'])
+        pad_start = torch.from_numpy(bounds['pad_start'])
+        num_episodes = qa_start.numel()
+        # skip the very first episode so that i = j - block_size >= 0
+        if num_episodes <= 1:
             ix = torch.randint(len(data) - block_size, (batch_size,))
+        else:
+            ep_idx = torch.randint(1, num_episodes, (batch_size,), dtype=torch.int64)
+            qa_sel = qa_start[ep_idx]
+            pad_sel = pad_start[ep_idx]
+            # ensure lower bound at least half context
+            j_low = torch.maximum(qa_sel, torch.full_like(qa_sel, block_size // 2))
+            j_high = torch.maximum(pad_sel, j_low + 1)
+            span = j_high - j_low
+            offset = (torch.rand_like(span, dtype=torch.float32) * span.float()).to(torch.int64)
+            j_pos = j_low + offset
+            j_sel = ep_idx * block_size + j_pos
+            ix = (j_sel - block_size).to(torch.int64)
     else:
         # Uniform sampling over entire stream for all other datasets
         ix = torch.randint(len(data) - block_size, (batch_size,))
@@ -355,12 +410,8 @@ def get_batch(split):
     # - tuple(y_start_cpu, y_end_cpu): original interface for contiguous spans (k_judge, kv_retrieval)
     # - torch.BoolTensor mask of shape (B, T) on CPU marking positions in Y to include in loss (kv_retrieval_multihop)
     answer_spans = None
-    if dataset in ('k_judge', 'kv_retrieval'):
+    if dataset in ('k_judge', 'kv_retrieval') and start_t is not None and end_t is not None:
         try:
-            # ix is i (start index of X in the absolute data stream)
-            # Y corresponds to absolute indices [i+1, i+block_size]
-            # compute y_start = start_abs - (i+1), y_end = end_abs - (i+1)
-            # clamp to [0, block_size]
             start_abs = start_t
             end_abs = end_t
             i_abs = ix.to(torch.int64)
@@ -372,18 +423,30 @@ def get_batch(split):
         except Exception:
             answer_spans = None
     elif dataset == 'kv_retrieval_multihop':
-        # For multihop dataset the answers are single-token labels that follow ANS_START markers inside X.
-        # Create a per-sample boolean mask (on CPU) marking Y positions to include in the loss.
-        try:
-            meta_path_local = os.path.join(data_dir, 'meta.pkl')
-            with open(meta_path_local, 'rb') as f_meta:
-                meta_local = pickle.load(f_meta)
-            ans_start_token = int(meta_local['special_tokens']['ANS_START'])
-            # x is currently a CPU tensor of shape (B, T); answers to predict are Y[p] where X[p] == ANS_START
-            mask = (x == ans_start_token)
-            # mask dtype is bool on CPU; this will be interpreted by the masked loss function
+        # Build mask covering all QA answer spans (between '=' and '\n') within the sampled episode.
+        starts, ends, _ = _get_answer_segments(split)
+        if starts.size > 0:
+            mask = torch.zeros((batch_size, block_size), dtype=torch.bool)
+            starts_t = torch.from_numpy(starts)
+            ends_t = torch.from_numpy(ends)
+            for b, i_val in enumerate(ix.tolist()):
+                ep = (int(i_val) + block_size) // block_size
+                ep_mask = (starts_t // block_size) == ep
+                if not torch.any(ep_mask):
+                    continue
+                s_abs = starts_t[ep_mask]
+                e_abs = ends_t[ep_mask]
+                rel_s = s_abs - (int(i_val) + 1)
+                rel_e = e_abs - (int(i_val) + 1)
+                rel_s = torch.clamp(rel_s, min=0, max=block_size)
+                rel_e = torch.clamp(rel_e, min=0, max=block_size)
+                for s, e in zip(rel_s, rel_e):
+                    s_i = int(s.item())
+                    e_i = int(e.item())
+                    if e_i > s_i:
+                        mask[b, s_i:e_i] = True
             answer_spans = mask.cpu()
-        except Exception:
+        else:
             answer_spans = None
 
     if device_type == 'cuda':
@@ -395,35 +458,6 @@ def get_batch(split):
     # Callers should move them to device as needed inside the loss helper.
     return x, y, answer_spans
 
-# ---------------- Multihop answer token extraction -----------------
-# For kv_retrieval_multihop, answer tokens immediately follow ANS_START markers.
-# We treat each (ANS_START, label) as an answer span of length 1 (the label token).
-def _extract_multihop_answer_spans(x_batch: torch.Tensor, ans_start_token: int) -> tuple:
-    """Return (y_start, y_end) CPU tensors marking single-token answer spans in Y.
-
-    We locate ANS_START positions inside X (which is length block_size) but answers to predict are next tokens in Y.
-    For position p in X where X[p] == ANS_START, the predicted answer token is Y[p].
-    So span relative to Y is [p, p+1).
-    """
-    B, T = x_batch.shape
-    starts = []
-    ends = []
-    for b in range(B):
-        row = x_batch[b]
-        pos = (row == ans_start_token).nonzero(as_tuple=False).view(-1)
-        for p in pos:
-            p_int = int(p.item())
-            if p_int < T:  # answer token exists at Y[p]
-                starts.append(p_int)
-                ends.append(p_int + 1)
-    if not starts:
-        return None
-    # For uniform interface we need per-batch single span; but there can be multiple answers.
-    # We'll compress all answer tokens into one merged multi-segment by setting min start and max end if contiguous.
-    # However masked loss logic expects one span per batch element; easier: return None (no masking) and rely on metrics.
-    # Instead, for metrics we will handle multihop separately; return None here.
-    return None
-
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
 iter_num = 0
 best_val_loss = 1e9
@@ -434,6 +468,8 @@ best_train_answer_token_acc = 0.0
 best_val_answer_token_acc = 0.0
 best_train_answer_exact_match = 0.0
 best_val_answer_exact_match = 0.0
+best_train_first_token_acc = 0.0
+best_val_first_token_acc = 0.0
 
 # attempt to derive vocab_size from the dataset
 meta_path = os.path.join(data_dir, 'meta.pkl')
@@ -446,7 +482,8 @@ if os.path.exists(meta_path):
 
 # model init
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
-                  bias=bias, vocab_size=None, dropout=dropout) # start with model_args from command line
+                  bias=bias, vocab_size=None, dropout=dropout, attention_type=attention_type,
+                  linear_backend=linear_backend) # start with model_args from command line
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
@@ -464,7 +501,7 @@ elif init_from == 'resume':
     checkpoint_model_args = checkpoint['model_args']
     # force these config attributes to be equal otherwise we can't even resume training
     # the rest of the attributes (e.g. dropout) can stay as desired from command line
-    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
+    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size', 'attention_type', 'linear_backend']:
         model_args[k] = checkpoint_model_args[k]
     # create the model
     gptconf = GPTConfig(**model_args)
@@ -485,7 +522,7 @@ elif init_from.startswith('gpt2'):
     override_args = dict(dropout=dropout)
     model = GPT.from_pretrained(init_from, override_args)
     # read off the created config params, so we can store them into checkpoint correctly
-    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
+    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size', 'attention_type', 'linear_backend']:
         model_args[k] = getattr(model.config, k)
 # crop down the model block size if desired, using model surgery
 if block_size < model.config.block_size:
@@ -516,112 +553,194 @@ if ddp:
 # helps estimate an arbitrarily accurate loss over either split using many batches
 @torch.no_grad()
 def estimate_metrics():
-    """Estimate loss, last-token accuracy, answer-token accuracy and answer exact-match over many batches.
-
-    For kv_retrieval_multihop: answer tokens are labels directly after ANS_START markers (single-token answers).
-    """
+    """Estimate loss, last-token accuracy, answer-token accuracy and answer exact-match over many batches."""
     out = {}
     model.eval()
     for split in ['train', 'val']:
         losses = torch.zeros(eval_iters)
         accs_last = torch.zeros(eval_iters)
-        # answer-segment metrics
-        ans_token_correct = 0
-        ans_token_total = 0
-        ans_exact_matches = 0
-        ans_samples_with_answer = 0
+
+        # EPISODE-level counters (legacy behavior)
+        ep_token_correct = 0
+        ep_token_total = 0
+        ep_exact_matches = 0
+        ep_samples_with_answer = 0
+        ep_first_correct = 0
+        ep_first_total = 0
+
+        # SPAN-level counters (per disjoint continuous answer span)
+        span_token_correct = 0
+        span_token_total = 0
+        span_exact_matches = 0
+        span_samples_with_answer = 0
+        span_first_correct = 0
+        span_first_total = 0
+
+        def _extract_spans_from_mask(mask_b):
+            # mask_b: 1D boolean tensor on CPU
+            pos = torch.nonzero(mask_b, as_tuple=False).view(-1)
+            spans = []
+            if pos.numel() == 0:
+                return spans
+            start = int(pos[0].item())
+            prev = start
+            for idx in pos[1:]:
+                cur = int(idx.item())
+                if cur == prev + 1:
+                    prev = cur
+                    continue
+                spans.append((start, prev + 1))
+                start = cur
+                prev = cur
+            spans.append((start, prev + 1))
+            return spans
+
         for k in range(eval_iters):
             X, Y, spans = get_batch(split)
-            # For multihop dataset, identify answer tokens inline
-            multihop_answer_positions = None
-            if dataset == 'kv_retrieval_multihop':
-                # Load special tokens from meta
-                meta_path_local = os.path.join(data_dir, 'meta.pkl')
-                try:
-                    with open(meta_path_local, 'rb') as f_meta:
-                        meta_local = pickle.load(f_meta)
-                    ans_start_token = meta_local['special_tokens']['ANS_START']
-                    # positions where X == ANS_START; Y at same index holds answer label
-                    multihop_answer_positions = (X == ans_start_token).nonzero(as_tuple=False)
-                except Exception:
-                    multihop_answer_positions = None
             if use_masked_answer_loss:
                 with ctx:
                     logits, _ = model(X, Y)
-                # compute loss only on answer spans when available
                 loss_masked = _masked_cross_entropy_on_answer(logits, Y, spans)
                 losses[k] = loss_masked.item()
             else:
                 with ctx:
                     logits, loss = model(X, Y)
                 losses[k] = loss.item()
+
             pred_tokens = torch.argmax(logits, dim=-1)
             acc_last = (pred_tokens[:, -1] == Y[:, -1]).float().mean().item()
             accs_last[k] = acc_last
-            if dataset in ('k_judge', 'kv_retrieval') and spans is not None:
-                y_start, y_end = spans
-                T = Y.size(1)
-                half = T // 2
-                for b in range(Y.size(0)):
-                    s = int(y_start[b].item())
-                    e = int(y_end[b].item())
-                    # restrict to second half only
-                    s2 = max(s, half)
-                    if e <= s2:
-                        continue
-                    tgt = Y[b, s2:e]
-                    pred = pred_tokens[b, s2:e]
-                    correct = (pred == tgt).sum().item()
-                    total = tgt.numel()
-                    ans_token_correct += correct
-                    ans_token_total += total
-                    if correct == total:
-                        ans_exact_matches += 1
-                    ans_samples_with_answer += 1
-            elif dataset == 'kv_retrieval_multihop' and multihop_answer_positions is not None and multihop_answer_positions.numel() > 0:
-                # multihop_answer_positions: rows of [batch_index, position]
-                # Group by batch index to compute exact match per sample
-                by_batch: Dict[int, List[int]] = {}
-                T = Y.size(1)
-                half = T // 2
-                for row in multihop_answer_positions:
-                    b_idx = int(row[0].item())
-                    pos = int(row[1].item())
-                    # only consider answers in the second half
-                    if pos >= half:
-                        by_batch.setdefault(b_idx, []).append(pos)
-                for b, positions in by_batch.items():
-                    positions.sort()
-                    if len(positions) == 0:
-                        continue
-                    all_correct = True
-                    for pos in positions:
-                        tgt = Y[b, pos]
-                        pred = pred_tokens[b, pos]
-                        ans_token_total += 1
-                        if int(pred.item()) == int(tgt.item()):
-                            ans_token_correct += 1
-                        else:
-                            all_correct = False
-                    ans_samples_with_answer += 1
-                    if all_correct:
-                        ans_exact_matches += 1
 
-        # finalize answer-segment metrics
-        if ans_token_total > 0:
-            ans_token_acc = ans_token_correct / ans_token_total
+            T = Y.size(1)
+            half = T // 2
+            B = Y.size(0)
+
+            # handle contiguous span interface (tuple) and boolean mask interface
+            if spans is not None and isinstance(spans, tuple):
+                y_start, y_end = spans
+                for b in range(B):
+                    try:
+                        s = int(y_start[b].item())
+                        e = int(y_end[b].item())
+                    except Exception:
+                        continue
+                    s = max(0, min(T, s))
+                    e = max(0, min(T, e))
+                    # EPISODE-level: consider positions from max(s, half) .. e
+                    s2 = max(s, half)
+                    if e > s2:
+                        ep_samples_with_answer += 1
+                        # first-token at episode-level is at s2
+                        if int(pred_tokens[b, s2].item()) == int(Y[b, s2].item()):
+                            ep_first_correct += 1
+                        ep_first_total += 1
+                        tgt = Y[b, s2:e]
+                        pred = pred_tokens[b, s2:e]
+                        correct = (pred == tgt).sum().item()
+                        total = tgt.numel()
+                        ep_token_correct += correct
+                        ep_token_total += total
+                        if correct == total:
+                            ep_exact_matches += 1
+
+                    # SPAN-level: the contiguous (s,e) is a single span; apply half cutoff per-span
+                    pos = list(range(max(s, half), e)) if e > max(s, half) else []
+                    if len(pos) > 0:
+                        span_samples_with_answer += 1
+                        first_idx = pos[0]
+                        if int(pred_tokens[b, first_idx].item()) == int(Y[b, first_idx].item()):
+                            span_first_correct += 1
+                        span_first_total += 1
+                        correct = sum(1 for i in pos if int(pred_tokens[b, i].item()) == int(Y[b, i].item()))
+                        total = len(pos)
+                        span_token_correct += correct
+                        span_token_total += total
+                        if correct == total:
+                            span_exact_matches += 1
+
+            elif spans is not None and isinstance(spans, torch.Tensor) and spans.dtype == torch.bool:
+                # spans is boolean mask (B, T)
+                for b in range(B):
+                    mask_b = spans[b]
+                    if mask_b.numel() != T:
+                        continue
+                    # EPISODE-level: flatten all positions marked and then apply half cutoff
+                    pos_all = torch.nonzero(mask_b, as_tuple=False).view(-1)
+                    if pos_all.numel() > 0:
+                        pos_after = pos_all[pos_all >= half]
+                        if pos_after.numel() > 0:
+                            ep_samples_with_answer += 1
+                            first_idx = int(pos_after[0].item())
+                            if int(pred_tokens[b, first_idx].item()) == int(Y[b, first_idx].item()):
+                                ep_first_correct += 1
+                            ep_first_total += 1
+                            tgt = Y[b, pos_after].to(pred_tokens.device)
+                            pred = pred_tokens[b, pos_after]
+                            correct = (pred == tgt).sum().item()
+                            total = tgt.numel()
+                            ep_token_correct += correct
+                            ep_token_total += total
+                            if correct == total:
+                                ep_exact_matches += 1
+
+                    # SPAN-level: extract disjoint continuous spans and evaluate each separately
+                    spans_list = _extract_spans_from_mask(mask_b)
+                    for (s, e) in spans_list:
+                        # positions within this span considered after half cutoff
+                        pos = [i for i in range(s, e) if i >= half]
+                        if len(pos) == 0:
+                            continue
+                        span_samples_with_answer += 1
+                        first_idx = pos[0]
+                        if int(pred_tokens[b, first_idx].item()) == int(Y[b, first_idx].item()):
+                            span_first_correct += 1
+                        span_first_total += 1
+                        correct = sum(1 for i in pos if int(pred_tokens[b, i].item()) == int(Y[b, i].item()))
+                        total = len(pos)
+                        span_token_correct += correct
+                        span_token_total += total
+                        if correct == total:
+                            span_exact_matches += 1
+
+        # finalize episode-level metrics (legacy keys)
+        if ep_token_total > 0:
+            ep_token_acc = ep_token_correct / ep_token_total
         else:
-            ans_token_acc = 0.0
-        if ans_samples_with_answer > 0:
-            ans_exact_match_rate = ans_exact_matches / ans_samples_with_answer
+            ep_token_acc = 0.0
+        if ep_first_total > 0:
+            ep_first_acc = ep_first_correct / ep_first_total
         else:
-            ans_exact_match_rate = 0.0
+            ep_first_acc = 0.0
+        if ep_samples_with_answer > 0:
+            ep_exact_rate = ep_exact_matches / ep_samples_with_answer
+        else:
+            ep_exact_rate = 0.0
+
+        # finalize span-level metrics
+        if span_token_total > 0:
+            span_token_acc = span_token_correct / span_token_total
+        else:
+            span_token_acc = 0.0
+        if span_first_total > 0:
+            span_first_acc = span_first_correct / span_first_total
+        else:
+            span_first_acc = 0.0
+        if span_samples_with_answer > 0:
+            span_exact_rate = span_exact_matches / span_samples_with_answer
+        else:
+            span_exact_rate = 0.0
 
         out[split] = {
             'loss': losses.mean().item(),
             'last_token_acc': accs_last.mean().item(),
-            'answer_token_acc': ans_token_acc,
-            'answer_exact_match': ans_exact_match_rate,
+            # episode-level (legacy)
+            'answer_token_acc_ep': ep_token_acc,
+            'answer_exact_match_ep': ep_exact_rate,
+            'first_token_acc_ep': ep_first_acc,
+            # span-level (new)
+            'answer_token_acc_span': span_token_acc,
+            'answer_exact_match_span': span_exact_rate,
+            'first_token_acc_span': span_first_acc,
         }
     model.train()
     return out
@@ -725,10 +844,19 @@ while True:
         val_loss = metrics['val']['loss']
         train_acc = metrics['train']['last_token_acc']
         val_acc = metrics['val']['last_token_acc']
-        train_ans_token_acc = metrics['train'].get('answer_token_acc', 0.0)
-        val_ans_token_acc = metrics['val'].get('answer_token_acc', 0.0)
-        train_ans_exact = metrics['train'].get('answer_exact_match', 0.0)
-        val_ans_exact = metrics['val'].get('answer_exact_match', 0.0)
+        train_ans_token_acc = metrics['train'].get('answer_token_acc_ep', 0.0)
+        val_ans_token_acc = metrics['val'].get('answer_token_acc_ep', 0.0)
+        train_ans_exact = metrics['train'].get('answer_exact_match_ep', 0.0)
+        val_ans_exact = metrics['val'].get('answer_exact_match_ep', 0.0)
+        train_first_token_acc = metrics['train'].get('first_token_acc_ep', 0.0)
+        val_first_token_acc = metrics['val'].get('first_token_acc_ep', 0.0)
+        # span-level metrics
+        train_ans_token_acc_span = metrics['train'].get('answer_token_acc_span', 0.0)
+        val_ans_token_acc_span = metrics['val'].get('answer_token_acc_span', 0.0)
+        train_ans_exact_span = metrics['train'].get('answer_exact_match_span', 0.0)
+        val_ans_exact_span = metrics['val'].get('answer_exact_match_span', 0.0)
+        train_first_token_acc_span = metrics['train'].get('first_token_acc_span', 0.0)
+        val_first_token_acc_span = metrics['val'].get('first_token_acc_span', 0.0)
         # update best-seen metrics (train/val)
         if train_acc > best_train_last_token_acc:
             best_train_last_token_acc = train_acc
@@ -742,14 +870,20 @@ while True:
             best_train_answer_exact_match = train_ans_exact
         if val_ans_exact > best_val_answer_exact_match:
             best_val_answer_exact_match = val_ans_exact
+        if train_first_token_acc > best_train_first_token_acc:
+            best_train_first_token_acc = train_first_token_acc
+        if val_first_token_acc > best_val_first_token_acc:
+            best_val_first_token_acc = val_first_token_acc
         if iter_num > 0:
             elapsed_time = time.time() - start_t0
             total_estimated_time = elapsed_time / iter_num * max_iters
             print(f"step {iter_num}: estimated total training time: {total_estimated_time/3600:.2f} hours")
         print(f"step {iter_num}: train loss {train_loss:.4f}, val loss {val_loss:.4f}"
             f"\ntrain last_acc {train_acc:.4f}, val last_acc {val_acc:.4f}"
-            f"\ntrain ans_token_acc {train_ans_token_acc:.4f}, val ans_token_acc {val_ans_token_acc:.4f}"
-            f"\ntrain ans_exact {train_ans_exact:.4f}, val ans_exact {val_ans_exact:.4f}")
+            f"\nEPISODE-level: train ans_token_acc {train_ans_token_acc:.4f}, val ans_token_acc {val_ans_token_acc:.4f}"
+            f"\nEPISODE-level: train ans_exact {train_ans_exact:.4f}, val ans_exact {val_ans_exact:.4f}"
+            f"\nSPAN-level: train ans_token_acc {train_ans_token_acc_span:.4f}, val ans_token_acc {val_ans_token_acc_span:.4f}"
+            f"\nSPAN-level: train ans_exact {train_ans_exact_span:.4f}, val ans_exact {val_ans_exact_span:.4f}")
         if wandb_log:
             wandb.log({
                 "iter": iter_num,
@@ -757,10 +891,13 @@ while True:
                 "val/loss": val_loss,
                 "train/last_token_acc": train_acc,
                 "val/last_token_acc": val_acc,
-                "train/answer_token_acc": train_ans_token_acc,
-                "val/answer_token_acc": val_ans_token_acc,
-                "train/answer_exact_match": train_ans_exact,
-                "val/answer_exact_match": val_ans_exact,
+                # span-level exact match & token/first acc
+                "train/answer_token_acc_span": train_ans_token_acc_span,
+                "val/answer_token_acc_span": val_ans_token_acc_span,
+                "train/first_token_acc_span": train_first_token_acc_span,
+                "val/first_token_acc_span": val_first_token_acc_span,
+                "train/answer_exact_match_span": train_ans_exact_span,
+                "val/answer_exact_match_span": val_ans_exact_span,
                 "best_val_loss": min(best_val_loss, val_loss) if best_val_loss is not None else val_loss,
                 # log the best seen metrics (train and val)
                 "best/train/last_token_acc": best_train_last_token_acc,
@@ -769,6 +906,8 @@ while True:
                 "best/val/answer_token_acc": best_val_answer_token_acc,
                 "best/train/answer_exact_match": best_train_answer_exact_match,
                 "best/val/answer_exact_match": best_val_answer_exact_match,
+                "best/train/first_token_acc": best_train_first_token_acc,
+                "best/val/first_token_acc": best_val_first_token_acc,
                 "total_tokens": iter_num * tokens_per_iter,
                 "total_samples": iter_num * tokens_per_iter // block_size,
                 "lr": lr,
@@ -783,27 +922,84 @@ while True:
             try:
                 with open(log_path, 'w') as flog:
                     # Get a fresh eval batch for logging predictions
-                    Xs, Ys, _sp = get_batch('val')
+                    Xs, Ys, spans_eval = get_batch('val')
                     with torch.no_grad():
                         logits, _ = model(Xs, Ys)
                         preds = torch.argmax(logits, dim=-1)
                     max_show = min(5, Xs.size(0))
-                    # Only output the last N tokens for readability
-                    max_tokens_log = 100
+                    max_tokens_log = 400  # last tokens to display
+                    max_str_chars = 400
+                    enc_log = tiktoken.get_encoding('gpt2')
+
+                    def _rows_to_table(x_row, y_row, p_row, mask_row):
+                        """Right-align columns and mark answer tokens."""
+                        rows = []
+                        width = 6
+                        x_row = x_row[-max_tokens_log:]
+                        y_row = y_row[-max_tokens_log:]
+                        p_row = p_row[-max_tokens_log:]
+                        if mask_row is not None:
+                            mask_row = mask_row[-max_tokens_log:]
+                        else:
+                            mask_row = torch.zeros_like(y_row, dtype=torch.bool)
+                        for idx, (xt, yt, pt, mk) in enumerate(zip(x_row, y_row, p_row, mask_row)):
+                            marker = '*' if bool(mk) else ' '
+                            rows.append(
+                                f"{idx:04d} | {str(int(xt)).rjust(width)} | {str(int(yt)).rjust(width)} | {str(int(pt)).rjust(width)} | {marker}"
+                            )
+                        return rows
+
                     for b in range(max_show):
                         x_tokens = Xs[b].cpu()
                         y_tokens = Ys[b].cpu()
                         p_tokens = preds[b].cpu()
-                        if x_tokens.numel() > max_tokens_log:
-                            x_tokens = x_tokens[-max_tokens_log:]
-                        if y_tokens.numel() > max_tokens_log:
-                            y_tokens = y_tokens[-max_tokens_log:]
-                        if p_tokens.numel() > max_tokens_log:
-                            p_tokens = p_tokens[-max_tokens_log:]
-                        flog.write('X: ' + ' '.join(str(int(t)) for t in x_tokens) + '\n')
-                        flog.write('Y: ' + ' '.join(str(int(t)) for t in y_tokens) + '\n')
-                        flog.write('P: ' + ' '.join(str(int(t)) for t in p_tokens) + '\n')
-                        flog.write('\n')
+                        mask_tokens = None
+                        if spans_eval is not None:
+                            # contiguous-span interface (k_judge, kv_retrieval)
+                            if isinstance(spans_eval, tuple):
+                                try:
+                                    y_start_eval, y_end_eval = spans_eval
+                                    if b < y_start_eval.size(0):
+                                        s = int(y_start_eval[b].item())
+                                        e = int(y_end_eval[b].item())
+                                        s = max(0, min(y_tokens.size(0), s))
+                                        e = max(0, min(y_tokens.size(0), e))
+                                        if e > s:
+                                            mask_tokens = torch.zeros_like(y_tokens, dtype=torch.bool)
+                                            mask_tokens[s:e] = True
+                                except Exception:
+                                    mask_tokens = None
+                            # boolean mask interface (kv_retrieval_multihop)
+                            elif isinstance(spans_eval, torch.Tensor) and spans_eval.dtype == torch.bool:
+                                try:
+                                    if b < spans_eval.size(0):
+                                        # align to the last tokens shown; _rows_to_table will slice to last tokens
+                                        mask_tokens = spans_eval[b].clone()
+                                        if mask_tokens.numel() != y_tokens.numel():
+                                            # if lengths differ (paranoid), clamp/resize
+                                            mask_tokens = mask_tokens[-y_tokens.numel():]
+                                except Exception:
+                                    mask_tokens = None
+                        flog.write(f"# sample {b}\n")
+                        flog.write("idx  |      X |      Y |      P | ans\n")
+                        flog.write("-------------------------------------\n")
+                        for line in _rows_to_table(x_tokens, y_tokens, p_tokens, mask_tokens):
+                            flog.write(line + "\n")
+                        flog.write("\n")
+                        # decoded strings (truncated for readability)
+                        try:
+                            x_str = enc_log.decode(x_tokens.tolist())
+                            y_str = enc_log.decode(y_tokens.tolist())
+                            p_str = enc_log.decode(p_tokens.tolist())
+                        except Exception:
+                            x_str = ''.join(str(int(t)) + ' ' for t in x_tokens.tolist())
+                            y_str = ''.join(str(int(t)) + ' ' for t in y_tokens.tolist())
+                            p_str = ''.join(str(int(t)) + ' ' for t in p_tokens.tolist())
+                        def _clip_str(s):
+                            return s[-max_str_chars:]
+                        flog.write(f"X_str: {_clip_str(x_str)}\n")
+                        flog.write(f"Y_str: {_clip_str(y_str)}\n")
+                        flog.write(f"P_str: {_clip_str(p_str)}\n\n")
                 print(f"Logged eval samples to {log_path}")
             except Exception as e:
                 print(f"Eval logging failed: {e}")
@@ -823,6 +1019,8 @@ while True:
                     'best_val_answer_token_acc': best_val_answer_token_acc,
                     'best_train_answer_exact_match': best_train_answer_exact_match,
                     'best_val_answer_exact_match': best_val_answer_exact_match,
+                    'best_train_first_token_acc': best_train_first_token_acc,
+                    'best_val_first_token_acc': best_val_first_token_acc,
                     'config': config,
                 }
                 print(f"saving checkpoint to {out_dir}")

@@ -10,6 +10,7 @@ https://github.com/huggingface/transformers/blob/main/src/transformers/models/gp
 import math
 import inspect
 from dataclasses import dataclass
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -47,8 +48,8 @@ def apply_rope(x, cos, sin):
     B, nh, T, embd = x.shape
     x_even = x[..., ::2]
     x_odd = x[..., 1::2]
-    cos = cos.view(1, 1, T, -1)
-    sin = sin.view(1, 1, T, -1)
+    cos = cos.view(1, 1, T, cos.size(-1))
+    sin = sin.view(1, 1, T, sin.size(-1))
     x_even_rot = x_even * cos - x_odd * sin
     x_odd_rot = x_even * sin + x_odd * cos
     x_out = torch.empty_like(x)
@@ -71,46 +72,112 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
+        self.attn_type = getattr(config, 'attention_type', 'causal')
+        # backend selector for linear attention: None (default) or 'fla_multiscale', 'fla_deltanet', etc.
+        # Treat None as the default (pure-Python) backend; non-empty strings request external backends.
+        self.linear_backend = getattr(config, 'linear_backend', None)
         self.head_dim = config.n_embd // config.n_head
 
+        assert self.attn_type in ("causal", "linear"), f"Unsupported attention_type={self.attn_type}"
         assert self.head_dim % 2 == 0, "RoPE requires head_dim to be even"
         self.rope = RotaryEmbedding(self.head_dim, base=config.rope_base)
         # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
-        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
-        if not self.flash:
+        self.flash = self.attn_type == 'causal' and hasattr(torch.nn.functional, 'scaled_dot_product_attention')
+        if not self.flash and self.attn_type == 'causal':
             print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
             # causal mask to ensure that attention is only applied to the left in the input sequence
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
 
+        # try to import flash-linear-attention (fla) layers if requested
+        self.fla_available = False
+        self.fla_module = None
+        if self.attn_type == 'linear' and self.linear_backend:
+            try:
+                from fla import layers as fla_layers
+                # directly map known class names (keep only Multiscale, DeltaNet, GatedDeltaNet)
+                self.fla_module = None
+                if self.linear_backend == 'fla_multiscale':
+                    from fla.layers import MultiScaleRetention
+                    self.fla_module = MultiScaleRetention(hidden_size=self.n_embd, num_heads=self.n_head)
+                elif self.linear_backend == 'fla_deltanet':
+                    from fla.layers import DeltaNet
+                    self.fla_module = DeltaNet(hidden_size=self.n_embd, num_heads=self.n_head)
+                elif self.linear_backend == 'fla_gateddeltanet':
+                    from fla.layers import GatedDeltaNet
+                    self.fla_module = GatedDeltaNet(hidden_size=self.n_embd, num_heads=self.n_head)
+                
+                if self.fla_module is not None:
+                    try:
+                        # try to convert module to bfloat16 on capable GPUs, since some fla kernels require bfloat16
+                        self.fla_requires_bf16 = False
+                        try:
+                            if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+                                self.fla_module = self.fla_module.to(dtype=torch.bfloat16)
+                                self.fla_requires_bf16 = True
+                            else:
+                                # detect module param dtype
+                                params = list(self.fla_module.parameters())
+                                if len(params) > 0 and params[0].dtype == torch.bfloat16:
+                                    self.fla_requires_bf16 = True
+                        except Exception as e:
+                            print(f"Warning: unable to set fla module dtype to bfloat16: {e}")
+                    except Exception:
+                        self.fla_module = None
+
+                if self.fla_module is not None:
+                    self.fla_available = True
+                else:
+                    print(f"Warning: requested linear_backend={self.linear_backend} but matching class not found/instantiable in fla.layers; falling back to PyTorch linear path")
+            except Exception as e:
+                self.fla_available = False
+                print(f"Warning: unable to import flash-linear-attention (fla) layers: {e}; falling back to PyTorch linear path")
+
     def forward(self, x):
-        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
+        if self.attn_type == 'linear' and self.linear_backend and self.linear_backend != 'py' and self.fla_available and self.fla_module is not None:
+            # ensure input dtype matches module expectations (some fla kernels require bfloat16)
+            orig_dtype = x.dtype
+            module_params = list(self.fla_module.parameters())
+            module_requires_bf16 = getattr(self, 'fla_requires_bf16', False) or (len(module_params) > 0 and module_params[0].dtype == torch.bfloat16)
 
-        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+            if module_requires_bf16 and x.dtype != torch.bfloat16:
+                x = x.to(dtype=torch.bfloat16)
 
-        cos, sin = self.rope.get_cos_sin(T, device=x.device, dtype=x.dtype)
-        q = apply_rope(q, cos, sin)
-        k = apply_rope(k, cos, sin)
+            # fla modules usually accept (B, T, C) and return (B, T, C)
+            y = self.fla_module(x)
+            y = y[0]
 
-        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
-        if self.flash:
-            # efficient attention using Flash Attention CUDA kernels
-            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
+            # cast back to original dtype if needed
+            if y.dtype != orig_dtype:
+                y = y.to(dtype=orig_dtype)  
+            y = self.resid_dropout(y)          
         else:
-            # manual implementation of attention
-            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-            att = F.softmax(att, dim=-1)
-            att = self.attn_dropout(att)
-            y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
+            B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
-        # output projection
-        y = self.resid_dropout(self.c_proj(y))
+            # calculate query, key, values for all heads in batch and move head forward to be the batch dim
+            q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
+            k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+            q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+            v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+
+            cos, sin = self.rope.get_cos_sin(T, device=x.device, dtype=x.dtype)
+            q = apply_rope(q, cos, sin)
+            k = apply_rope(k, cos, sin)
+
+            if self.flash:
+                # efficient attention using Flash Attention CUDA kernels
+                y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
+            else:
+                # manual implementation of attention
+                att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+                att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+                att = F.softmax(att, dim=-1)
+                att = self.attn_dropout(att)
+                y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+            y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
+
+            # output projection
+            y = self.resid_dropout(self.c_proj(y))
         return y
 
 class MLP(nn.Module):
@@ -153,6 +220,8 @@ class GPTConfig:
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
     rope_base: int = 10000
+    attention_type: str = "causal" # 'causal' (default) or 'linear'
+    linear_backend: Optional[str] = None # None (default) or 'fla_multiscale' or 'fla_mamba2' or 'fla_gated_deltanet'
 
 class GPT(nn.Module):
 
