@@ -102,10 +102,10 @@ class CausalSelfAttention(nn.Module):
                     self.fla_module = MultiScaleRetention(hidden_size=self.n_embd, num_heads=self.n_head)
                 elif self.linear_backend == 'fla_deltanet':
                     from fla.layers import DeltaNet
-                    self.fla_module = DeltaNet(hidden_size=self.n_embd, num_heads=self.n_head)
+                    self.fla_module = DeltaNet(hidden_size=self.n_embd, num_heads=self.n_head, head_dim=128)
                 elif self.linear_backend == 'fla_gateddeltanet':
                     from fla.layers import GatedDeltaNet
-                    self.fla_module = GatedDeltaNet(hidden_size=self.n_embd, num_heads=self.n_head)
+                    self.fla_module = GatedDeltaNet(hidden_size=self.n_embd, num_heads=self.n_head, head_dim=128, expand_v=1)
                 
                 if self.fla_module is not None:
                     try:
